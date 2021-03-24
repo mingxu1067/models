@@ -23,32 +23,37 @@ import numpy as np
 import paddle
 from paddle.io import DataLoader
 
-from paddlenlp.datasets import GlueQNLI, GlueSST2
+from paddle.metric import Accuracy
+from paddlenlp.datasets import GlueCoLA, GlueSST2, GlueMRPC, GlueSTSB, GlueMNLI, GlueQNLI, GlueRTE
 from paddlenlp.data import Stack, Tuple, Pad
 from paddlenlp.data.sampler import SamplerHelper
 from paddlenlp.transformers import BertForSequenceClassification, BertTokenizer
-
-FORMAT = '%(asctime)s-%(levelname)s: %(message)s'
-logging.basicConfig(level=logging.INFO, format=FORMAT)
-logger = logging.getLogger(__name__)
+from paddlenlp.transformers import ErnieForSequenceClassification, ErnieTokenizer
+from paddlenlp.metrics import Mcc, PearsonAndSpearman
+from paddlenlp.utils.log import logger
+from paddle.fluid.contrib.sparsity import ASPHelper, check_mask_2d, check_mask_1d
+from paddle.fluid import global_scope
+from paddle.fluid.io import load_vars
 
 TASK_CLASSES = {
-    "qnli": (GlueQNLI, paddle.metric.Accuracy),  # (dataset, metric)
-    "sst-2": (GlueSST2, paddle.metric.Accuracy),
+    "cola": (GlueCoLA, Mcc),
+    "sst": (GlueSST2, Accuracy),
+    "sts": (GlueSTSB, PearsonAndSpearman),
+    "mnli": (GlueMNLI, Accuracy),
+    "qnli": (GlueQNLI, Accuracy),
+    "rte": (GlueRTE, Accuracy),
 }
 
-MODEL_CLASSES = {"bert": (BertForSequenceClassification, BertTokenizer), }
+MODEL_CLASSES = {
+    "bert": (BertForSequenceClassification, BertTokenizer),
+    "ernie": (ErnieForSequenceClassification, ErnieTokenizer),
+}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
     # Required parameters
-    parser.add_argument(
-        "--select_device",
-        default="gpu",
-        type=str,
-        help="The device that selecting for the training, must be gpu/xpu.")
     parser.add_argument(
         "--task_name",
         default=None,
@@ -80,6 +85,13 @@ def parse_args():
         type=str,
         required=True,
         help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--load_dir",
+        default=None,
+        type=str,
+        required=False,
+        help="The directory where the model predictions and checkpoints will be loaded.",
     )
     parser.add_argument(
         "--max_seq_length",
@@ -137,24 +149,38 @@ def parse_args():
         help="Save checkpoint every X updates steps.")
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for initialization")
+    parser.add_argument(
+        "--select_device",
+        type=str,
+        default="gpu",
+        help="Device for selecting for the training.")
+    parser.add_argument(
+        "--sparsity",
+        default=False,
+        type=bool,
+        help="True for enabling ASP.",
+    )
     args = parser.parse_args()
     return args
 
 
-def create_data_holder():
+def create_data_holder(task_name):
     input_ids = paddle.static.data(
         name="input_ids", shape=[-1, -1], dtype="int64")
     segment_ids = paddle.static.data(
         name="segment_ids", shape=[-1, -1], dtype="int64")
-    label = paddle.static.data(name="label", shape=[-1, 1], dtype="int64")
+    if task_name == "sts":
+        label = paddle.static.data(name="label", shape=[-1, 1], dtype="float32")
+    else:
+        label = paddle.static.data(name="label", shape=[-1, 1], dtype="int64")
 
     return [input_ids, segment_ids, label]
 
 
-def reset_program_state_dict(model, state_dict, pretrained_state_dict):
+def reset_program_state_dict(args, model, state_dict, pretrained_state_dict):
     reset_state_dict = {}
     scale = model.initializer_range if hasattr(model, "initializer_range")\
-        else model.bert.config["initializer_range"]
+        else getattr(model, args.model_type).config["initializer_range"]
     for n, p in state_dict.items():
         if n not in pretrained_state_dict:
             dtype_str = "float32"
@@ -168,19 +194,32 @@ def reset_program_state_dict(model, state_dict, pretrained_state_dict):
 
 
 def set_seed(args):
-    random.seed(args.seed + paddle.distributed.get_rank())
-    np.random.seed(args.seed + paddle.distributed.get_rank())
-    paddle.seed(args.seed + paddle.distributed.get_rank())
+    # Use the same data seed(for data shuffle) for all procs to guarantee data
+    # consistency after sharding.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    # Maybe different op seeds(for dropout) for different procs is better. By:
+    # `paddle.seed(args.seed + paddle.distributed.get_rank())`
+    paddle.seed(args.seed)
 
 
 def evaluate(exe, metric, loss, correct, dev_program, data_loader):
     metric.reset()
+    returns = [loss]
+    if isinstance(correct, list) or isinstance(correct, tuple):
+        returns.extend(list(correct))
+    else:
+        returns.append(correct)
     for batch in data_loader:
-        loss_return, correct_return = exe.run(dev_program, feed=batch, \
-           fetch_list=[loss, correct])
-        metric.update(correct_return)
+        exe.run(dev_program, feed=batch, \
+           fetch_list=returns)
+        return_numpys = exe.run(dev_program, feed=batch, \
+           fetch_list=returns)
+        metric_numpy = return_numpys[1] if len(return_numpys[
+            1:]) == 1 else return_numpys[1:]
+        metric.update(metric_numpy)
         accuracy = metric.accumulate()
-    print("eval loss: %f, accuracy: %f" % (loss_return, accuracy))
+    print("eval loss: %f, acc: %s" % (return_numpys[0], accuracy))
 
 
 def convert_example(example,
@@ -261,12 +300,12 @@ def do_train(args):
     place = paddle.set_device(args.select_device)
     set_seed(args)
 
-    # Create the main_program for the training and dev_program for the validation 
+    # Create the main_program for the training and dev_program for the validation
     main_program = paddle.static.default_main_program()
     startup_program = paddle.static.default_startup_program()
     dev_program = paddle.static.Program()
 
-    # Get the configuration of tokenizer and model  
+    # Get the configuration of tokenizer and model
     args.task_name = args.task_name.lower()
     args.model_type = args.model_type.lower()
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
@@ -274,7 +313,7 @@ def do_train(args):
 
     # Create the tokenizer and dataset
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
-    train_dataset, dev_dataset = dataset_class.get_datasets(["train", "dev"])
+    train_dataset = dataset_class.get_datasets(["train"])
 
     trans_func = partial(
         convert_example,
@@ -293,15 +332,11 @@ def do_train(args):
     train_batch_sampler = paddle.io.BatchSampler(
         train_dataset, batch_size=args.batch_size, shuffle=True)
 
-    dev_dataset = dev_dataset.apply(trans_func, lazy=True)
-    dev_batch_sampler = paddle.io.BatchSampler(
-        dev_dataset, batch_size=args.batch_size, shuffle=False)
-
     feed_list_name = []
 
     # Define the input data and create the train/dev data_loader
     with paddle.static.program_guard(main_program, startup_program):
-        [input_ids, segment_ids, labels] = create_data_holder()
+        [input_ids, segment_ids, labels] = create_data_holder(args.task_name)
 
     train_data_loader = DataLoader(
         dataset=train_dataset,
@@ -311,27 +346,57 @@ def do_train(args):
         num_workers=0,
         return_list=False)
 
-    dev_data_loader = DataLoader(
-        dataset=dev_dataset,
-        feed_list=[input_ids, segment_ids, labels],
-        batch_sampler=dev_batch_sampler,
-        collate_fn=batchify_fn,
-        num_workers=0,
-        return_list=False)
+    if args.task_name == "mnli":
+        dev_dataset_matched, dev_dataset_mismatched = dataset_class.get_datasets(
+            ["dev_matched", "dev_mismatched"])
+        dev_dataset_matched = dev_dataset_matched.apply(trans_func, lazy=True)
+        dev_dataset_mismatched = dev_dataset_mismatched.apply(
+            trans_func, lazy=True)
+        dev_batch_sampler_matched = paddle.io.BatchSampler(
+            dev_dataset_matched, batch_size=args.batch_size, shuffle=False)
+        dev_data_loader_matched = DataLoader(
+            dataset=dev_dataset_matched,
+            batch_sampler=dev_batch_sampler_matched,
+            feed_list=[input_ids, segment_ids, labels],
+            collate_fn=batchify_fn,
+            num_workers=0,
+            return_list=False)
+        dev_batch_sampler_mismatched = paddle.io.BatchSampler(
+            dev_dataset_mismatched, batch_size=args.batch_size, shuffle=False)
+        dev_data_loader_mismatched = DataLoader(
+            dataset=dev_dataset_mismatched,
+            feed_list=[input_ids, segment_ids, labels],
+            batch_sampler=dev_batch_sampler_mismatched,
+            collate_fn=batchify_fn,
+            num_workers=0,
+            return_list=False)
+    else:
+        dev_dataset = dataset_class.get_datasets(["dev"])
+        dev_dataset = dev_dataset.apply(trans_func, lazy=True)
+        dev_batch_sampler = paddle.io.BatchSampler(
+            dev_dataset, batch_size=args.batch_size, shuffle=False)
+        dev_data_loader = DataLoader(
+            dataset=dev_dataset,
+            feed_list=[input_ids, segment_ids, labels],
+            batch_sampler=dev_batch_sampler,
+            collate_fn=batchify_fn,
+            num_workers=0,
+            return_list=False)
 
     # Create the training-forward program, and clone it for the validation
     with paddle.static.program_guard(main_program, startup_program):
+        num_class = 1 if train_dataset.get_labels() is None else len(
+            train_dataset.get_labels())
         model, pretrained_state_dict = model_class.from_pretrained(
-            args.model_name_or_path,
-            num_classes=len(train_dataset.get_labels()))
+            args.model_name_or_path, num_classes=num_class)
         loss_fct = paddle.nn.loss.CrossEntropyLoss(
         ) if train_dataset.get_labels() else paddle.nn.loss.MSELoss()
         logits = model(input_ids, segment_ids)
         loss = loss_fct(logits, labels)
         dev_program = main_program.clone(for_test=True)
 
-    # Create the training-backward program, this pass will not be 
-    # executed in the validation    
+    # Create the training-backward program, this pass will not be
+    # executed in the validation
     with paddle.static.program_guard(main_program, startup_program):
         lr_scheduler = paddle.optimizer.lr.LambdaDecay(
             args.learning_rate,
@@ -352,22 +417,57 @@ def do_train(args):
                 p.name for n, p in model.named_parameters()
                if not any(nd in n for nd in ["bias", "norm"])
         ])
-        optimizer.minimize(loss)
+        if args.sparsity:
+            ASPHelper.minimize(loss, optimizer, place, main_program, startup_program)
+        else:
+            optimizer.minimize(loss)
+
+    # for param in main_program.global_block().all_parameters():
+    #     print(param)
+    # with open("./__model__", "wb") as f:
+        # f.write(main_program.desc.serialize_to_string())
+    # input("Press any key to continue...")
+
 
     # Create the metric pass for the validation
     with paddle.static.program_guard(dev_program, startup_program):
         metric = metric_class()
         correct = metric.compute(logits, labels)
 
-    # Initialize the fine-tuning parameter, we will load the parameters in 
+    # Initialize the fine-tuning parameter, we will load the parameters in
     # pre-training model. And initialize the parameter which not in pre-training model
-    # by the normal distribution. 
+    # by the normal distribution.
     exe = paddle.static.Executor(place)
     exe.run(startup_program)
     state_dict = model.state_dict()
-    reset_state_dict = reset_program_state_dict(model, state_dict,
+    reset_state_dict = reset_program_state_dict(args, model, state_dict,
                                                 pretrained_state_dict)
     paddle.static.set_program_state(main_program, reset_state_dict)
+
+    if args.load_dir is not None:
+        print("-------------------- Loading model --------------------")
+        print("Load model weights from:", args.load_dir)
+        load_vars(exe, args.load_dir, main_program, vars=ASPHelper.get_vars(main_program))
+        if args.task_name == "mnli":
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader_matched)
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader_mismatched)
+        else:
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader)
+    if args.sparsity:
+        print("-------------------- Sparsity Pruning --------------------")
+        # ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
+        ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_2d_best')
+        if args.task_name == "mnli":
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader_matched)
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader_mismatched)
+        else:
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader)
 
     global_step = 0
     tic_train = time.time()
@@ -375,23 +475,75 @@ def do_train(args):
         for step, batch in enumerate(train_data_loader):
             global_step += 1
             loss_return = exe.run(main_program, feed=batch, fetch_list=[loss])
-            if global_step % args.logging_steps == 0:
-                logger.info(
-                    "global step %d, epoch: %d, batch: %d, loss: %f, speed: %.2f step/s"
-                    % (global_step, epoch, step, loss_return[0],
-                       args.logging_steps / (time.time() - tic_train)))
-                tic_train = time.time()
+
             lr_scheduler.step()
-            if global_step % args.save_steps == 0:
-                # Validation pass, record the loss and metric 
-                evaluate(exe, metric, loss, correct, dev_program,
-                         dev_data_loader)
-                output_dir = os.path.join(args.output_dir,
-                                          "model_%d" % global_step)
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
-                paddle.fluid.io.save_params(exe, output_dir)
-                tokenizer.save_pretrained(output_dir)
+            # if global_step % args.logging_steps == 0:
+            #     logger.info(
+            #         "global step %d, epoch: %d, batch: %d, loss: %f, speed: %.2f step/s"
+            #         % (global_step, epoch, step, loss_return[0],
+            #            args.logging_steps / (time.time() - tic_train)))
+            #     tic_train = time.time()
+            # if (global_step % args.save_steps == 0):
+            #     # Validation pass, record the loss and metric
+            #     if args.task_name == "mnli":
+            #         evaluate(exe, metric, loss, correct, dev_program,
+            #                  dev_data_loader_matched)
+            #         evaluate(exe, metric, loss, correct, dev_program,
+            #                  dev_data_loader_mismatched)
+            #     else:
+            #         evaluate(exe, metric, loss, correct, dev_program,
+            #                  dev_data_loader)
+            #     output_dir = os.path.join(args.output_dir,
+            #                               "model_%d" % global_step)
+            #     if not os.path.exists(output_dir):
+            #         os.makedirs(output_dir)
+            #     paddle.fluid.io.save_params(exe, output_dir)
+            #     tokenizer.save_pretrained(output_dir)
+
+        print("Epoch: {} Evaluating".format(epoch))
+        if args.task_name == "mnli":
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader_matched)
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader_mismatched)
+        else:
+            evaluate(exe, metric, loss, correct, dev_program,
+                        dev_data_loader)
+        output_dir = os.path.join(args.output_dir,
+                                    "model_%d" % global_step)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        paddle.fluid.io.save_params(exe, output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+    # # Final evaluation
+    # if args.task_name == "mnli":
+    #     evaluate(exe, metric, loss, correct, dev_program,
+    #                 dev_data_loader_matched)
+    #     evaluate(exe, metric, loss, correct, dev_program,
+    #                 dev_data_loader_mismatched)
+    # else:
+    #     evaluate(exe, metric, loss, correct, dev_program,
+    #                 dev_data_loader)
+
+    output_dir = os.path.join(args.output_dir, "model_final")
+    # Final evaluation
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    paddle.fluid.io.save_params(exe, output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+    if args.sparsity:
+        print("-------------------- Sparsity Checking --------------------")
+        for param in main_program.global_block().all_parameters():
+            if ASPHelper.is_supported_layer(param.name):
+                mat = np.array(global_scope().find_var(param.name).get_tensor())
+                valid = check_mask_1d(mat, 4, 2)
+                # valid = check_mask_2d(mat, 4, 2)
+                # if valid:
+                #     print(param.name, "Sparsity Validation:", valid)
+                # else:
+                #     print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
 
 
 if __name__ == "__main__":

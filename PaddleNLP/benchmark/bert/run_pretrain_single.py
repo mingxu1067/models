@@ -28,6 +28,8 @@ from paddle.io import DataLoader, Dataset
 from paddlenlp.transformers import BertForPretraining, BertModel, BertPretrainingCriterion
 from paddlenlp.transformers import BertTokenizer
 from data import create_data_holder, create_pretraining_dataset
+from paddle.fluid.contrib.sparsity import ASPHelper, check_mask_2d, check_mask_1d
+from paddle.fluid import global_scope
 
 MODEL_CLASSES = {"bert": (BertForPretraining, BertTokenizer)}
 
@@ -137,6 +139,12 @@ def parse_args():
         type=float,
         default=1.0,
         help="The value of scale_loss for fp16.")
+    parser.add_argument(
+        "--sparsity",
+        default=False,
+        type=bool,
+        help="True for enabling ASP.",
+    )
     args = parser.parse_args()
     return args
 
@@ -155,20 +163,34 @@ def build_compiled_program(main_program, loss):
     return main_program
 
 
-def reset_program_state_dict(model, state_dict):
-    scale = model.initializer_range if hasattr(model, "initializer_range")\
-        else model.bert.config["initializer_range"]
+# def reset_program_state_dict(model, state_dict):
+#     scale = model.initializer_range if hasattr(model, "initializer_range")\
+#         else model.bert.config["initializer_range"]
 
-    new_state_dict = dict()
+#     new_state_dict = dict()
+#     for n, p in state_dict.items():
+#         if "layer_norm" not in p.name:
+#             dtype_str = "float32"
+#             if str(p.dtype) == "VarType.FP64":
+#                 dtype_str = "float64"
+#             new_state_dict[p.name] = np.random.normal(
+#                 loc=0.0, scale=scale, size=p.shape).astype(dtype_str)
+#     return new_state_dict
+
+def reset_program_state_dict(model, state_dict, pretrained_state_dict):
+    reset_state_dict = {}
+    scale = model.initializer_range if hasattr(model, "initializer_range")\
+            else model.bert.config["initializer_range"]
     for n, p in state_dict.items():
-        if "layer_norm" not in p.name:
+        if n not in pretrained_state_dict:
             dtype_str = "float32"
             if str(p.dtype) == "VarType.FP64":
                 dtype_str = "float64"
-            new_state_dict[p.name] = np.random.normal(
+            reset_state_dict[p.name] = np.random.normal(
                 loc=0.0, scale=scale, size=p.shape).astype(dtype_str)
-    return new_state_dict
-
+        else:
+            reset_state_dict[p.name] = pretrained_state_dict[n]
+    return reset_state_dict
 
 def set_seed(seed):
     random.seed(seed)
@@ -198,9 +220,10 @@ def do_train(args):
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
     config = model_class.pretrained_init_configuration[args.model_name_or_path]
-    if config["vocab_size"] % 8 != 0:
-        config["vocab_size"] += 8 - (config["vocab_size"] % 8)
-    model = BertForPretraining(BertModel(**config))
+    # if config["vocab_size"] % 8 != 0:
+    #     config["vocab_size"] += 8 - (config["vocab_size"] % 8)
+    # model = BertForPretraining(BertModel(**config))
+    model, pretrained_state_dict = model_class.from_pretrained(args.model_name_or_path)
     criterion = BertPretrainingCriterion(model.bert.config["vocab_size"])
     prediction_scores, seq_relationship_score = model(
         input_ids=input_ids,
@@ -239,7 +262,10 @@ def do_train(args):
             amp_list,
             init_loss_scaling=args.scale_loss,
             use_dynamic_loss_scaling=True)
-    optimizer.minimize(loss)
+    if args.sparsity:
+        ASPHelper.minimize(loss, optimizer, place, main_program, startup_program)
+    else:
+        optimizer.minimize(loss)
 
     # Define the Executor for running the static model
     exe = paddle.static.Executor(place)
@@ -247,10 +273,21 @@ def do_train(args):
     state_dict = model.state_dict()
 
     # Use the state dict to update the parameter
-    reset_state_dict = reset_program_state_dict(model, state_dict)
+    reset_state_dict = reset_program_state_dict(model, state_dict, pretrained_state_dict)
     paddle.static.set_program_state(main_program, reset_state_dict)
+
+    # for param in main_program.global_block().all_parameters():
+    #     print(param)
+
+    if args.sparsity:
+        print("-------------------- Sparsity Pruning --------------------")
+        ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
+        # ASPHelper.prune_model(main_program, startup_program, place)
+
+    precompiled_program = main_program
     # Construct the compiled program
     main_program = build_compiled_program(main_program, loss)
+
     global_step = 0
     tic_train = time.time()
     epoch = 0
@@ -291,6 +328,18 @@ def do_train(args):
                     tokenizer.save_pretrained(output_dir)
                 if global_step >= args.max_steps:
                     del train_data_loader
+
+                    if args.sparsity:
+                        print("-------------------- Sparsity Checking --------------------")
+                        for param in precompiled_program.global_block().all_parameters():
+                            if ASPHelper.is_supported_layer(param.name):
+                                mat = np.array(global_scope().find_var(param.name).get_tensor())
+                                valid = check_mask_1d(mat, 4, 2)
+                                # valid = check_mask_2d(mat, 4, 2)
+                                if valid:
+                                    print(param.name, "Sparsity Validation:", valid)
+                                else:
+                                    print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
                     return
             del train_data_loader
         epoch += 1
