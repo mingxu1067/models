@@ -278,7 +278,7 @@ def do_train(args):
             use_dynamic_loss_scaling=True)
     if args.sparsity:
         ASPHelper.set_excluded_layers(['linear_73', 'linear_74'])
-        ASPHelper.minimize(loss, optimizer, place, main_program, startup_program)
+        ASPHelper.minimize(loss, optimizer, main_program, startup_program)
     else:
         optimizer.minimize(loss)
 
