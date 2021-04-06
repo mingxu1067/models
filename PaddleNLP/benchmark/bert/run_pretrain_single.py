@@ -30,6 +30,7 @@ from paddlenlp.transformers import BertTokenizer
 from data import create_data_holder, create_pretraining_dataset
 from paddle.fluid.contrib.sparsity import ASPHelper, check_mask_2d, check_mask_1d
 from paddle.fluid import global_scope
+from paddle.fluid.io import load_vars
 
 MODEL_CLASSES = {"bert": (BertForPretraining, BertTokenizer)}
 
@@ -140,10 +141,23 @@ def parse_args():
         default=1.0,
         help="The value of scale_loss for fp16.")
     parser.add_argument(
+        "--load_dir",
+        default=None,
+        type=str,
+        required=False,
+        help="The directory where the model predictions and checkpoints will be loaded.",
+    )
+    parser.add_argument(
         "--sparsity",
         default=False,
         type=bool,
         help="True for enabling ASP.",
+    )
+    parser.add_argument(
+        "--nonprune",
+        default=False,
+        type=bool,
+        help="True for pruning models in ASP.",
     )
     args = parser.parse_args()
     return args
@@ -263,6 +277,7 @@ def do_train(args):
             init_loss_scaling=args.scale_loss,
             use_dynamic_loss_scaling=True)
     if args.sparsity:
+        ASPHelper.set_excluded_layers(['linear_73', 'linear_74'])
         ASPHelper.minimize(loss, optimizer, place, main_program, startup_program)
     else:
         optimizer.minimize(loss)
@@ -278,8 +293,20 @@ def do_train(args):
 
     # for param in main_program.global_block().all_parameters():
     #     print(param)
+    # input()
 
-    if args.sparsity:
+    if args.load_dir is not None:
+        print("-------------------- Loading model --------------------")
+        print("Load model weights from:", args.load_dir)
+        load_vars(exe, args.load_dir, main_program, vars=ASPHelper.get_vars(main_program))
+        for param in main_program.global_block().all_parameters():
+            if ASPHelper.is_supported_layer(param.name):
+                mat = np.array(global_scope().find_var(param.name).get_tensor())
+                valid = check_mask_1d(mat.T, 4, 2)
+                # valid = check_mask_2d(mat, 4, 2)
+                assert valid, "{} is not in 2:4 sparse pattern".format(param.name)
+
+    if args.sparsity and (not args.nonprune):
         print("-------------------- Sparsity Pruning --------------------")
         ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
         # ASPHelper.prune_model(main_program, startup_program, place)
@@ -334,7 +361,7 @@ def do_train(args):
                         for param in precompiled_program.global_block().all_parameters():
                             if ASPHelper.is_supported_layer(param.name):
                                 mat = np.array(global_scope().find_var(param.name).get_tensor())
-                                valid = check_mask_1d(mat, 4, 2)
+                                valid = check_mask_1d(mat.T, 4, 2)
                                 # valid = check_mask_2d(mat, 4, 2)
                                 if valid:
                                     print(param.name, "Sparsity Validation:", valid)

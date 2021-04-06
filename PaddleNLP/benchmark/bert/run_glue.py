@@ -418,7 +418,7 @@ def do_train(args):
                if not any(nd in n for nd in ["bias", "norm"])
         ])
         if args.sparsity:
-            ASPHelper.minimize(loss, optimizer, place, main_program, startup_program)
+            ASPHelper.minimize(loss, optimizer, main_program, startup_program)
         else:
             optimizer.minimize(loss)
 
@@ -510,21 +510,11 @@ def do_train(args):
             evaluate(exe, metric, loss, correct, dev_program,
                         dev_data_loader)
         output_dir = os.path.join(args.output_dir,
-                                    "model_%d" % global_step)
+                                    "model_%d" % epoch)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         paddle.fluid.io.save_params(exe, output_dir)
         tokenizer.save_pretrained(output_dir)
-
-    # # Final evaluation
-    # if args.task_name == "mnli":
-    #     evaluate(exe, metric, loss, correct, dev_program,
-    #                 dev_data_loader_matched)
-    #     evaluate(exe, metric, loss, correct, dev_program,
-    #                 dev_data_loader_mismatched)
-    # else:
-    #     evaluate(exe, metric, loss, correct, dev_program,
-    #                 dev_data_loader)
 
     output_dir = os.path.join(args.output_dir, "model_final")
     # Final evaluation
@@ -538,12 +528,12 @@ def do_train(args):
         for param in main_program.global_block().all_parameters():
             if ASPHelper.is_supported_layer(param.name):
                 mat = np.array(global_scope().find_var(param.name).get_tensor())
-                valid = check_mask_1d(mat, 4, 2)
-                # valid = check_mask_2d(mat, 4, 2)
-                # if valid:
-                #     print(param.name, "Sparsity Validation:", valid)
-                # else:
-                #     print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
+                # valid = check_mask_1d(mat, 4, 2)
+                valid = check_mask_2d(mat, 4, 2)
+                if valid:
+                    print(param.name, "Sparsity Validation:", valid)
+                else:
+                    print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
 
 
 if __name__ == "__main__":
