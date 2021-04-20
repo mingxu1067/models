@@ -294,11 +294,17 @@ def do_train(args):
     # for param in main_program.global_block().all_parameters():
     #     print(param)
     # input()
+    # with open("./__model__", "wb") as f:
+    #     f.write(main_program.desc.serialize_to_string())
+    # return
 
     if args.load_dir is not None:
         print("-------------------- Loading model --------------------")
         print("Load model weights from:", args.load_dir)
-        load_vars(exe, args.load_dir, main_program, vars=ASPHelper.get_vars(main_program))
+        vars=ASPHelper.get_vars(main_program)
+        if args.nonprune:
+            vars = main_program.global_block().all_parameters()
+        load_vars(exe, args.load_dir, main_program, vars=vars)
         for param in main_program.global_block().all_parameters():
             if ASPHelper.is_supported_layer(param.name):
                 mat = np.array(global_scope().find_var(param.name).get_tensor())

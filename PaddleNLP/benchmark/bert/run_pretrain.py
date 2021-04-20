@@ -32,6 +32,9 @@ from paddle.io import DataLoader, Dataset
 from paddlenlp.transformers import BertForPretraining, BertModel, BertPretrainingCriterion
 from paddlenlp.transformers import BertTokenizer
 from data import create_data_holder, create_pretraining_dataset
+from paddle.fluid.contrib.sparsity import ASPHelper, check_mask_1d
+from paddle.fluid import global_scope
+from paddle.fluid.io import load_vars
 
 MODEL_CLASSES = {"bert": (BertForPretraining, BertTokenizer)}
 
@@ -141,6 +144,25 @@ def parse_args():
         type=float,
         default=1.0,
         help="The value of scale_loss for fp16.")
+    parser.add_argument(
+        "--load_dir",
+        default=None,
+        type=str,
+        required=False,
+        help="The directory where the model predictions and checkpoints will be loaded.",
+    )
+    parser.add_argument(
+        "--sparsity",
+        default=False,
+        type=bool,
+        help="True for enabling ASP.",
+    )
+    parser.add_argument(
+        "--nonprune",
+        default=False,
+        type=bool,
+        help="True for pruning models in ASP.",
+    )
     args = parser.parse_args()
     return args
 
@@ -157,20 +179,34 @@ def select_dataset_file_for_each_worker(files, f_start_id, worker_num,
         data_file = files[(f_start_id * worker_num + worker_index) % num_files]
     return data_file
 
+# def reset_program_state_dict(model, state_dict):
+#     scale = model.initializer_range if hasattr(model, "initializer_range")\
+#         else model.bert.config["initializer_range"]
 
-def reset_program_state_dict(model, state_dict):
+#     new_state_dict = dict()
+#     for n, p in state_dict.items():
+#         if "layer_norm" not in p.name:
+#             dtype_str = "float32"
+#             if str(p.dtype) == "VarType.FP64":
+#                 dtype_str = "float64"
+#             new_state_dict[p.name] = np.random.normal(
+#                 loc=0.0, scale=scale, size=p.shape).astype(dtype_str)
+#     return new_state_dict
+
+def reset_program_state_dict(model, state_dict, pretrained_state_dict):
+    reset_state_dict = {}
     scale = model.initializer_range if hasattr(model, "initializer_range")\
-        else model.bert.config["initializer_range"]
-
-    new_state_dict = dict()
+            else model.bert.config["initializer_range"]
     for n, p in state_dict.items():
-        if "layer_norm" not in p.name:
+        if n not in pretrained_state_dict:
             dtype_str = "float32"
             if str(p.dtype) == "VarType.FP64":
                 dtype_str = "float64"
-            new_state_dict[p.name] = np.random.normal(
+            reset_state_dict[p.name] = np.random.normal(
                 loc=0.0, scale=scale, size=p.shape).astype(dtype_str)
-    return new_state_dict
+        else:
+            reset_state_dict[p.name] = pretrained_state_dict[n]
+    return reset_state_dict
 
 
 def build_compiled_program(main_program, loss):
@@ -227,9 +263,9 @@ def do_train(args):
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
     config = model_class.pretrained_init_configuration[args.model_name_or_path]
-    if config["vocab_size"] % 8 != 0:
-        config["vocab_size"] += 8 - (config["vocab_size"] % 8)
-    model = BertForPretraining(BertModel(**config))
+    # if config["vocab_size"] % 8 != 0:
+    #     config["vocab_size"] += 8 - (config["vocab_size"] % 8)
+    model, pretrained_state_dict = model_class.from_pretrained(args.model_name_or_path)
     criterion = BertPretrainingCriterion(model.bert.config["vocab_size"])
     prediction_scores, seq_relationship_score = model(
         input_ids=input_ids,
@@ -269,6 +305,9 @@ def do_train(args):
             init_loss_scaling=args.scale_loss,
             use_dynamic_loss_scaling=True)
     # Use the fleet api to compile the distributed optimizer
+    if args.sparsity:
+        ASPHelper.set_excluded_layers(['linear_73', 'linear_74'])
+        optimizer = ASPHelper.decorate(optimizer)
     strategy = fleet.DistributedStrategy()
     optimizer = fleet.distributed_optimizer(optimizer, strategy=strategy)
     optimizer.minimize(loss)
@@ -279,8 +318,27 @@ def do_train(args):
     state_dict = model.state_dict()
 
     # Use the state dict to update the parameter
-    reset_state_dict = reset_program_state_dict(model, state_dict)
+    reset_state_dict = reset_program_state_dict(model, state_dict, pretrained_state_dict)
     paddle.static.set_program_state(main_program, reset_state_dict)
+
+    if args.load_dir is not None:
+        print("-------------------- Loading model --------------------")
+        print("Load model weights from:", args.load_dir)
+        vars=ASPHelper.get_vars(main_program)
+        if args.nonprune:
+            vars = main_program.global_block().all_parameters()
+        load_vars(exe, args.load_dir, main_program, vars=vars)
+        for param in main_program.global_block().all_parameters():
+            if ASPHelper.is_supported_layer(param.name):
+                mat = np.array(global_scope().find_var(param.name).get_tensor())
+                valid = check_mask_1d(mat.T, 2, 4)
+                assert valid, "{} is not in 2:4 sparse pattern".format(param.name)
+
+    if args.sparsity and (not args.nonprune):
+        print("-------------------- Sparsity Pruning --------------------")
+        ASPHelper.prune_model(place, main_program)
+
+    precompiled_program = main_program
     # Construct the compiled program
     main_program = build_compiled_program(main_program, loss)
 
@@ -342,6 +400,17 @@ def do_train(args):
                         tokenizer.save_pretrained(output_dir)
                 if global_step >= args.max_steps:
                     del train_data_loader
+
+                    if args.sparsity:
+                        print("-------------------- Sparsity Checking --------------------")
+                        for param in precompiled_program.global_block().all_parameters():
+                            if ASPHelper.is_supported_layer(param.name):
+                                mat = np.array(global_scope().find_var(param.name).get_tensor())
+                                valid = check_mask_1d(mat.T, 2, 4)
+                                if valid:
+                                    print(param.name, "Sparsity Validation:", valid)
+                                else:
+                                    print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
                     return
             del train_data_loader
             train_data_loader, data_file = dataset_future.result(timeout=None)

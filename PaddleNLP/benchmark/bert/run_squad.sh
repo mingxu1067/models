@@ -12,3 +12,6 @@ python3.6 -u ./run_squad.py \
         --warmup_proportion 0.1 \
         --weight_decay 0.01 \
         --output_dir need_to_remove
+        # --load_dir ./squard_models \
+        # --sparsity true \
+        # --nonprune true

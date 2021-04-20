@@ -193,7 +193,12 @@ def parse_args():
         required=False,
         help="The directory where the model predictions and checkpoints will be loaded.",
     )
-
+    parser.add_argument(
+        "--nonprune",
+        default=False,
+        type=bool,
+        help="True for pruning models in ASP.",
+    )
     args = parser.parse_args()
     return args
 
@@ -366,6 +371,9 @@ def do_train(args):
                 p.name for n, p in model.named_parameters()
                 if not any(nd in n for nd in ["bias", "norm"])
             ])
+        if args.sparsity:
+            ASPHelper.set_excluded_layers(['linear_73'])
+            optimizer = ASPHelper.decorate(optimizer)
         optimizer.minimize(loss)
 
     exe = paddle.static.Executor(place)
@@ -378,14 +386,21 @@ def do_train(args):
     if args.load_dir is not None:
         print("-------------------- Loading model --------------------")
         print("Load model weights from:", args.load_dir)
-        load_vars(exe, args.load_dir, main_program, vars=ASPHelper.get_vars(main_program))
-        evaluate(exe, logits, dev_program, dev_data_loader, args)
+        vars=ASPHelper.get_vars(main_program)
+        if args.nonprune:
+            vars = main_program.global_block().all_parameters()
+        load_vars(exe, args.load_dir, main_program, vars=vars)
+        for param in main_program.global_block().all_parameters():
+            if ASPHelper.is_supported_layer(param.name):
+                mat = np.array(global_scope().find_var(param.name).get_tensor())
+                valid = check_mask_1d(mat.T, 2, 4)
+                assert valid, "{} is not in 2:4 sparse pattern".format(param.name)
 
-    if args.sparsity:
-        print("-------------------- Sparsity Pruning --------------------")
-        # ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
-        ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_2d_best')
-        evaluate(exe, logits, dev_program, dev_data_loader, args)
+    # if args.sparsity:
+    #     print("-------------------- Sparsity Pruning --------------------")
+    #     # ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
+    #     ASPHelper.prune_model(place, main_program)
+    #     evaluate(exe, logits, dev_program, dev_data_loader, args)
 
     global_step = 0
     tic_train = time.time()
@@ -423,11 +438,7 @@ def do_train(args):
         for param in main_program.global_block().all_parameters():
             if ASPHelper.is_supported_layer(param.name):
                 mat = np.array(global_scope().find_var(param.name).get_tensor())
-                # valid = check_mask_1d(mat, 4, 2)
-                valid = check_mask_2d(mat, 4, 2)
-                if valid:
-                    print(param.name, "Sparsity Validation:", valid)
-                else:
+                if not check_mask_1d(mat, 2, 4):
                     print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
 
 if __name__ == "__main__":
