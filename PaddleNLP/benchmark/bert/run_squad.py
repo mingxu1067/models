@@ -391,7 +391,7 @@ def do_train(args):
                 init_loss_scaling=args.scale_loss,
                 use_dynamic_loss_scaling=True)
         if args.sparsity:
-            ASPHelper.set_excluded_layers(['linear_72', 'linear_73'])
+            ASPHelper.set_excluded_layers(main_program, ['linear_72', 'linear_73'])
             optimizer = ASPHelper.decorate(optimizer)
         optimizer.minimize(loss)
 
@@ -411,7 +411,7 @@ def do_train(args):
         load_vars(exe, args.load_dir, main_program, vars=vars)
         if args.sparsity and args.nonprune:
             for param in main_program.global_block().all_parameters():
-                if ASPHelper.is_supported_layer(param.name):
+                if ASPHelper.is_supported_layer(main_program, param.name):
                     mat = np.array(global_scope().find_var(param.name).get_tensor())
                     assert check_mask_1d(mat.T, 4, 2), "{} is not in 2:4 sparse pattern".format(param.name)
         print("-------------------- Loading model Done ---------------")
