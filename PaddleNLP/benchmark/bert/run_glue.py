@@ -160,6 +160,12 @@ def parse_args():
         type=bool,
         help="True for enabling ASP.",
     )
+    parser.add_argument(
+        "--nonprune",
+        default=False,
+        type=bool,
+        help="True for pruning models in ASP.",
+    )
     args = parser.parse_args()
     return args
 
@@ -418,12 +424,12 @@ def do_train(args):
                if not any(nd in n for nd in ["bias", "norm"])
         ])
         if args.sparsity:
-            ASPHelper.minimize(loss, optimizer, main_program, startup_program)
-        else:
-            optimizer.minimize(loss)
+            ASPHelper.set_excluded_layers(['linear_73'])
+            optimizer = ASPHelper.decorate(optimizer)
+        optimizer.minimize(loss)
 
-    # for param in main_program.global_block().all_parameters():
-    #     print(param)
+    for param in main_program.global_block().all_parameters():
+        print(param.name)
     # with open("./__model__", "wb") as f:
         # f.write(main_program.desc.serialize_to_string())
     # input("Press any key to continue...")
@@ -447,27 +453,46 @@ def do_train(args):
     if args.load_dir is not None:
         print("-------------------- Loading model --------------------")
         print("Load model weights from:", args.load_dir)
-        load_vars(exe, args.load_dir, main_program, vars=ASPHelper.get_vars(main_program))
-        if args.task_name == "mnli":
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_matched)
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_mismatched)
-        else:
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader)
-    if args.sparsity:
+        vars=ASPHelper.get_vars(main_program)
+        if args.nonprune:
+            vars = main_program.global_block().all_parameters()
+        load_vars(exe, args.load_dir, main_program, vars=vars)
+        if args.sparsity and args.nonprune:
+            for param in main_program.global_block().all_parameters():
+                if ASPHelper.is_supported_layer(param.name):
+                    mat = np.array(global_scope().find_var(param.name).get_tensor())
+                    assert check_mask_1d(mat.T, 4, 2), "{} is not in 2:4 sparse pattern".format(param.name)
+        print("-------------------- Loading model Done ---------------")
+
+    if args.sparsity and (not args.nonprune):
         print("-------------------- Sparsity Pruning --------------------")
-        # ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
-        ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_2d_best')
-        if args.task_name == "mnli":
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_matched)
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_mismatched)
-        else:
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader)
+        ASPHelper.prune_model(place, main_program)
+        print("-------------------- Sparsity Pruning Done ---------------")
+
+    # if args.load_dir is not None:
+    #     print("-------------------- Loading model --------------------")
+    #     print("Load model weights from:", args.load_dir)
+    #     load_vars(exe, args.load_dir, main_program, vars=ASPHelper.get_vars(main_program))
+    #     if args.task_name == "mnli":
+    #         evaluate(exe, metric, loss, correct, dev_program,
+    #                     dev_data_loader_matched)
+    #         evaluate(exe, metric, loss, correct, dev_program,
+    #                     dev_data_loader_mismatched)
+    #     else:
+    #         evaluate(exe, metric, loss, correct, dev_program,
+    #                     dev_data_loader)
+    # if args.sparsity:
+    #     print("-------------------- Sparsity Pruning --------------------")
+    #     # ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
+    #     ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_2d_best')
+    #     if args.task_name == "mnli":
+    #         evaluate(exe, metric, loss, correct, dev_program,
+    #                     dev_data_loader_matched)
+    #         evaluate(exe, metric, loss, correct, dev_program,
+    #                     dev_data_loader_mismatched)
+    #     else:
+    #         evaluate(exe, metric, loss, correct, dev_program,
+    #                     dev_data_loader)
 
     global_step = 0
     tic_train = time.time()
@@ -526,14 +551,11 @@ def do_train(args):
     if args.sparsity:
         print("-------------------- Sparsity Checking --------------------")
         for param in main_program.global_block().all_parameters():
-            if ASPHelper.is_supported_layer(param.name):
-                mat = np.array(global_scope().find_var(param.name).get_tensor())
-                # valid = check_mask_1d(mat, 4, 2)
-                valid = check_mask_2d(mat, 4, 2)
-                if valid:
-                    print(param.name, "Sparsity Validation:", valid)
-                else:
-                    print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
+            # if ASPHelper.is_supported_layer(param.name):
+            mat = np.array(global_scope().find_var(param.name).get_tensor())
+            print(param.name, "is 2:4 sparse pattern?", check_mask_1d(mat.T, 4, 2))
+            # if not check_mask_1d(mat.T, 4, 2):
+            #         print("!!!!!!!!!!", param.name, "Not in 2:4 Sparsity Validation")
 
 
 if __name__ == "__main__":

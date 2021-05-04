@@ -49,9 +49,13 @@ class ErnieEmbeddings(nn.Layer):
 
     def forward(self, input_ids, token_type_ids=None, position_ids=None):
         if position_ids is None:
+            ones = paddle.ones_like(input_ids, dtype="int64")
+            seq_length = paddle.cumsum(ones, axis=1)
+            position_ids = seq_length - ones
+            position_ids.stop_gradient = True
             # maybe need use shape op to unify static graph and dynamic graph
-            seq_length = input_ids.shape[1]
-            position_ids = paddle.arange(0, seq_length, dtype="int64")
+            # seq_length = input_ids.shape[1]
+            # position_ids = paddle.arange(0, seq_length, dtype="int64")
         if token_type_ids is None:
             token_type_ids = paddle.zeros_like(input_ids, dtype="int64")
 
@@ -156,7 +160,7 @@ class ErniePretrainedModel(PretrainedModel):
             "ernie-tiny":
             "https://paddlenlp.bj.bcebos.com/models/transformers/ernie_tiny/ernie_tiny.pdparams",
             "ernie-2.0-en":
-            "https://paddlenlp.bj.bcebos.com/models/transformers/ernie_v2_base/ernie-2.0-en.pdparams",
+            "https://paddlenlp.bj.bcebos.com/models/transformers/ernie_v2_base/ernie_v2_eng_base.pdparams",
             "ernie-2.0-large-en":
             "https://paddlenlp.bj.bcebos.com/models/transformers/ernie_v2_large/ernie-2.0-large-en.pdparams",
         }
@@ -168,13 +172,16 @@ class ErniePretrainedModel(PretrainedModel):
         if isinstance(layer, (nn.Linear, nn.Embedding)):
             # only support dygraph, use truncated_normal and make it inplace
             # and configurable later
-            layer.weight.set_value(
-                paddle.tensor.normal(
-                    mean=0.0,
-                    std=self.initializer_range
-                    if hasattr(self, "initializer_range") else
-                    self.ernie.config["initializer_range"],
-                    shape=layer.weight.shape))
+            if isinstance(layer.weight, paddle.Tensor):
+                layer.weight.set_value(
+                    paddle.tensor.normal(
+                        mean=0.0,
+                        std=self.initializer_range
+                        if hasattr(self, "initializer_range") else
+                        self.ernie.config["initializer_range"],
+                        shape=layer.weight.shape))
+        elif isinstance(layer, nn.LayerNorm):
+            layer._epsilon = 1e-12
 
 
 @register_base_model

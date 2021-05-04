@@ -20,6 +20,7 @@ import time
 from functools import partial
 import numpy as np
 import paddle
+import distutils.util
 
 import argparse
 from paddle.io import DataLoader
@@ -199,6 +200,16 @@ def parse_args():
         type=bool,
         help="True for pruning models in ASP.",
     )
+    parser.add_argument(
+        "--use_amp",
+        type=distutils.util.strtobool,
+        default=False,
+        help="Enable mixed precision training.")
+    parser.add_argument(
+        "--scale_loss",
+        type=float,
+        default=1.0,
+        help="The value of scale_loss for fp16.")
     args = parser.parse_args()
     return args
 
@@ -350,7 +361,6 @@ def do_train(args):
 
     with paddle.static.program_guard(main_program, startup_program):
         loss = criterion(logits, (start_positions, end_positions))
-
         lr_scheduler = paddle.optimizer.lr.LambdaDecay(
             args.learning_rate,
             lambda current_step, warmup_proportion=args.warmup_proportion,
@@ -371,8 +381,17 @@ def do_train(args):
                 p.name for n, p in model.named_parameters()
                 if not any(nd in n for nd in ["bias", "norm"])
             ])
+
+        if args.use_amp:
+            amp_list = paddle.fluid.contrib.mixed_precision.AutoMixedPrecisionLists(
+                custom_white_list=['softmax', 'layer_norm', 'gelu'])
+            optimizer = paddle.fluid.contrib.mixed_precision.decorate(
+                optimizer,
+                amp_list,
+                init_loss_scaling=args.scale_loss,
+                use_dynamic_loss_scaling=True)
         if args.sparsity:
-            ASPHelper.set_excluded_layers(['linear_73'])
+            ASPHelper.set_excluded_layers(['linear_72', 'linear_73'])
             optimizer = ASPHelper.decorate(optimizer)
         optimizer.minimize(loss)
 
@@ -390,17 +409,18 @@ def do_train(args):
         if args.nonprune:
             vars = main_program.global_block().all_parameters()
         load_vars(exe, args.load_dir, main_program, vars=vars)
-        for param in main_program.global_block().all_parameters():
-            if ASPHelper.is_supported_layer(param.name):
-                mat = np.array(global_scope().find_var(param.name).get_tensor())
-                valid = check_mask_1d(mat.T, 2, 4)
-                assert valid, "{} is not in 2:4 sparse pattern".format(param.name)
+        if args.sparsity and args.nonprune:
+            for param in main_program.global_block().all_parameters():
+                if ASPHelper.is_supported_layer(param.name):
+                    mat = np.array(global_scope().find_var(param.name).get_tensor())
+                    assert check_mask_1d(mat.T, 4, 2), "{} is not in 2:4 sparse pattern".format(param.name)
+        print("-------------------- Loading model Done ---------------")
 
-    # if args.sparsity:
-    #     print("-------------------- Sparsity Pruning --------------------")
-    #     # ASPHelper.prune_model(main_program, startup_program, place, func_name='get_mask_1d_greedy')
-    #     ASPHelper.prune_model(place, main_program)
-    #     evaluate(exe, logits, dev_program, dev_data_loader, args)
+    if args.sparsity and (not args.nonprune):
+        print("-------------------- Sparsity Pruning --------------------")
+        ASPHelper.prune_model(place, main_program)
+        print("-------------------- Sparsity Pruning Done ---------------")
+        # evaluate(exe, logits, dev_program, dev_data_loader, args)
 
     global_step = 0
     tic_train = time.time()
@@ -436,10 +456,11 @@ def do_train(args):
     if args.sparsity:
         print("-------------------- Sparsity Checking --------------------")
         for param in main_program.global_block().all_parameters():
-            if ASPHelper.is_supported_layer(param.name):
-                mat = np.array(global_scope().find_var(param.name).get_tensor())
-                if not check_mask_1d(mat, 2, 4):
-                    print("!!!!!!!!!!", param.name, "Sparsity Validation:", valid)
+            # if ASPHelper.is_supported_layer(param.name):
+            mat = np.array(global_scope().find_var(param.name).get_tensor())
+            print(param.name, "is 2:4 sparse pattern?", check_mask_1d(mat.T, 4, 2))
+            # if not check_mask_1d(mat.T, 4, 2):
+            #         print("!!!!!!!!!!", param.name, "Not in 2:4 Sparsity Validation")
 
 if __name__ == "__main__":
     args = parse_args()

@@ -3,8 +3,8 @@ export CUDA_VISIBLE_DEVICES=0
 export TASK_NAME=sts
 
 python3.6 -u ./run_glue.py \
-    --model_type bert \
-    --model_name_or_path bert-base-uncased \
+    --model_type ernie \
+    --model_name_or_path ernie-2.0-en \
     --task_name $TASK_NAME \
     --max_seq_length 128 \
     --batch_size 64   \
@@ -14,4 +14,3 @@ python3.6 -u ./run_glue.py \
     --save_steps 1 \
     --output_dir ./need_to_remove \
     --nonprune true
-
