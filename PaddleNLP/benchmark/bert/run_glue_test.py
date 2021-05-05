@@ -191,7 +191,7 @@ def create_data_holder(task_name):
 
 def reset_program_state_dict(args, model, state_dict, pretrained_state_dict):
     reset_state_dict = {}
-    scale = model.initializer_range if hasattr(model, "initializer_range")\
+    scale = model.initializer_range if hasattr(model, "initializer_range") \
         else getattr(model, args.model_type).config["initializer_range"]
     for n, p in state_dict.items():
         if n not in pretrained_state_dict:
@@ -201,7 +201,7 @@ def reset_program_state_dict(args, model, state_dict, pretrained_state_dict):
             reset_state_dict[p.name] = np.random.normal(
                 loc=0.0, scale=scale, size=p.shape).astype(dtype_str)
         else:
-            reset_state_dict[p.name] = pretrained_state_dict[n]
+            reset_state_dict[p.name] = np.array(pretrained_state_dict[n])
     return reset_state_dict
 
 
@@ -405,7 +405,6 @@ def do_train(args):
         ) if train_dataset.get_labels() else paddle.nn.loss.MSELoss()
         logits = model(input_ids, segment_ids)
         loss = loss_fct(logits, labels)
-        dev_program = main_program.clone(for_test=True)
 
     # Create the training-backward program, this pass will not be
     # executed in the validation
@@ -429,10 +428,15 @@ def do_train(args):
                 p.name for n, p in model.named_parameters()
                if not any(nd in n for nd in ["bias", "norm"])
         ])
-        if args.sparsity:
-            ASPHelper.set_excluded_layers(main_program, ['linear_73'])
-            optimizer = ASPHelper.decorate(optimizer)
+        amp_list = paddle.fluid.contrib.mixed_precision.AutoMixedPrecisionLists(
+                custom_white_list=['softmax', 'layer_norm', 'gelu'])
+        optimizer = paddle.fluid.contrib.mixed_precision.decorate(
+            optimizer,
+            amp_list,
+            init_loss_scaling=1.0,
+            use_dynamic_loss_scaling=True)
         optimizer.minimize(loss)
+        dev_program = main_program.clone(for_test=True)
 
     for param in main_program.global_block().all_parameters():
         print(param.name)
@@ -460,8 +464,8 @@ def do_train(args):
         print("-------------------- Loading model --------------------")
         print("Load model weights from:", args.load_dir)
         vars=ASPHelper.get_vars(main_program)
-        if args.nonprune:
-            vars = main_program.global_block().all_parameters()
+        # if args.nonprune:
+        #     vars = main_program.global_block().all_parameters()
         load_vars(exe, args.load_dir, main_program, vars=vars)
         if args.sparsity and args.nonprune:
             for param in main_program.global_block().all_parameters():
@@ -472,21 +476,22 @@ def do_train(args):
 
     if args.sparsity and (not args.nonprune):
         print("-------------------- Sparsity Pruning --------------------")
-        ASPHelper.prune_model(place, main_program)
+        ASPHelper.prune_model(place, main_program, with_mask=False)
         print("-------------------- Sparsity Pruning Done ---------------")
+
+        output_dir = args.output_dir
+        # Final evaluation
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        paddle.fluid.io.save_params(exe, output_dir)
+        tokenizer.save_pretrained(output_dir)
 
     ts = 10
     overall_start_time = time.time()
-    for _ in range(10):
+    for _ in range(ts):
         st = time.time()
-        if args.task_name == "mnli":
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_matched)
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_mismatched)
-        else:
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader)
+        evaluate(exe, metric, loss, correct, dev_program,
+                    dev_data_loader)
         print("Dense Time:", time.time()-st)
     print("Dense Average Time:", (time.time()-overall_start_time)/ts)
 
@@ -497,16 +502,10 @@ def do_train(args):
         print("-------------------- Replacement Done --------------------")
 
     overall_start_time = time.time()
-    for _ in range(10):
+    for _ in range(ts):
         st = time.time()
-        if args.task_name == "mnli":
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_matched)
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader_mismatched)
-        else:
-            evaluate(exe, metric, loss, correct, dev_program,
-                        dev_data_loader)
+        evaluate(exe, metric, loss, correct, dev_program,
+                    dev_data_loader)
         print("Sparse Time:", time.time()-st)
     print("Sparse Average Time:", (time.time()-overall_start_time)/ts)
 

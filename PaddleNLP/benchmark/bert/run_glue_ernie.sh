@@ -4,7 +4,7 @@ export TASK_NAME=sts
 
 python3.6 -u ./run_glue_test.py \
     --model_type ernie \
-    --model_name_or_path ernie-2.0-en \
+    --model_name_or_path ernie-2.0-large-en \
     --task_name $TASK_NAME \
     --max_seq_length 128 \
     --batch_size 64   \
