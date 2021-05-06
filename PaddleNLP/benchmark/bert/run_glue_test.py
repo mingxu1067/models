@@ -231,7 +231,7 @@ def evaluate(exe, metric, loss, correct, dev_program, data_loader):
             1:]) == 1 else return_numpys[1:]
         metric.update(metric_numpy)
         accuracy = metric.accumulate()
-    print("eval loss: %f, acc: %s" % (return_numpys[0], accuracy))
+    # print("eval loss: %f, acc: %s" % (return_numpys[0], accuracy))
 
 
 def convert_example(example,
@@ -438,8 +438,8 @@ def do_train(args):
         optimizer.minimize(loss)
         dev_program = main_program.clone(for_test=True)
 
-    for param in main_program.global_block().all_parameters():
-        print(param.name)
+    # for param in main_program.global_block().all_parameters():
+    #     print(param.name)
     # with open("./__model__", "wb") as f:
         # f.write(main_program.desc.serialize_to_string())
     # input("Press any key to continue...")
@@ -497,8 +497,8 @@ def do_train(args):
 
     if args.cusparselt:
         print("-------------------- Replacement Start --------------------")
-        ASPHelper.replace_dense_to_sparse_op(main_program)
-        ASPHelper.compress_model(main_program, place)
+        ASPHelper.replace_dense_to_sparse_op(dev_program)
+        # ASPHelper.compress_model(dev_program, place)
         print("-------------------- Replacement Done --------------------")
 
     overall_start_time = time.time()
