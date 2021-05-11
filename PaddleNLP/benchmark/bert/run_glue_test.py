@@ -222,10 +222,12 @@ def evaluate(exe, metric, loss, correct, dev_program, data_loader):
         returns.extend(list(correct))
     else:
         returns.append(correct)
-
+    tse = 0.0
     for batch in data_loader:
+        st = time.time()
         exe.run(dev_program, feed=batch, \
            fetch_list=returns)
+        tse = time.time()-st
         break
         # return_numpys = exe.run(dev_program, feed=batch, \
         #    fetch_list=returns)
@@ -234,6 +236,7 @@ def evaluate(exe, metric, loss, correct, dev_program, data_loader):
         # metric.update(metric_numpy)
         # accuracy = metric.accumulate()
     # print("eval loss: %f, acc: %s" % (return_numpys[0], accuracy))
+    return tse*1000.0
 
 
 def convert_example(example,
@@ -482,11 +485,11 @@ def do_train(args):
         # if args.nonprune:
         #     vars = main_program.global_block().all_parameters()
         load_vars(exe, args.load_dir, main_program, vars=vars)
-        if args.sparsity and args.nonprune:
-            for param in main_program.global_block().all_parameters():
-                if ASPHelper.is_supported_layer(main_program, param.name):
-                    mat = np.array(global_scope().find_var(param.name).get_tensor())
-                    assert check_mask_1d(mat.T, 4, 2), "{} is not in 2:4 sparse pattern".format(param.name)
+        # if args.sparsity and args.nonprune:
+        #     for param in main_program.global_block().all_parameters():
+        #         if ASPHelper.is_supported_layer(main_program, param.name):
+        #             mat = np.array(global_scope().find_var(param.name).get_tensor())
+        #             assert check_mask_1d(mat.T, 4, 2), "{} is not in 2:4 sparse pattern".format(param.name)
         print("-------------------- Loading model Done ---------------")
 
     if args.sparsity and (not args.nonprune):
@@ -502,13 +505,13 @@ def do_train(args):
         tokenizer.save_pretrained(output_dir)
 
     ts = 10
-    overall_start_time = time.time()
+    dts = []
     for _ in range(ts):
-        st = time.time()
-        evaluate(exe, metric, loss, correct, dev_program,
+        dt = evaluate(exe, metric, loss, correct, dev_program,
                     dev_data_loader)
-        print("Dense Time:", time.time()-st)
-    print("Dense Average Time:", (time.time()-overall_start_time)/ts)
+        print("Dense Time:", dt)
+        dts.append(dt)
+    print("Dense Average Time:", (sum(dts))/ts)
 
     if args.cusparselt:
         print("-------------------- Replacement Start --------------------")
@@ -519,13 +522,13 @@ def do_train(args):
         #     print(op.type)
         print("-------------------- Replacement Done --------------------")
 
-    overall_start_time = time.time()
+    sts = []
     for _ in range(ts):
-        st = time.time()
-        evaluate(exe, metric, loss, correct, dev_program,
+        st = evaluate(exe, metric, loss, correct, dev_program,
                     dev_data_loader)
-        print("Sparse Time:", time.time()-st)
-    print("Sparse Average Time:", (time.time()-overall_start_time)/ts)
+        print("Sparse Time:", st)
+        sts.append(st)
+    print("Sparse Average Time:", (sum(sts))/ts)
 
 if __name__ == "__main__":
     args = parse_args()
