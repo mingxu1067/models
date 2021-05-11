@@ -266,15 +266,16 @@ class ErnieForSequenceClassification(ErniePretrainedModel):
                 token_type_ids=None,
                 position_ids=None,
                 attention_mask=None):
-        _, pooled_output = self.ernie(
-            input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask)
+        with paddle.static.amp.fp16_guard():
+            _, pooled_output = self.ernie(
+                input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask)
 
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
-        return logits
+            pooled_output = self.dropout(pooled_output)
+            logits = self.classifier(pooled_output)
+            return logits
 
 
 class ErnieForQuestionAnswering(ErniePretrainedModel):

@@ -222,15 +222,17 @@ def evaluate(exe, metric, loss, correct, dev_program, data_loader):
         returns.extend(list(correct))
     else:
         returns.append(correct)
+
     for batch in data_loader:
         exe.run(dev_program, feed=batch, \
            fetch_list=returns)
-        return_numpys = exe.run(dev_program, feed=batch, \
-           fetch_list=returns)
-        metric_numpy = return_numpys[1] if len(return_numpys[
-            1:]) == 1 else return_numpys[1:]
-        metric.update(metric_numpy)
-        accuracy = metric.accumulate()
+        break
+        # return_numpys = exe.run(dev_program, feed=batch, \
+        #    fetch_list=returns)
+        # metric_numpy = return_numpys[1] if len(return_numpys[
+        #     1:]) == 1 else return_numpys[1:]
+        # metric.update(metric_numpy)
+        # accuracy = metric.accumulate()
     # print("eval loss: %f, acc: %s" % (return_numpys[0], accuracy))
 
 
@@ -427,14 +429,25 @@ def do_train(args):
             apply_decay_param_fun=lambda x: x in [
                 p.name for n, p in model.named_parameters()
                if not any(nd in n for nd in ["bias", "norm"])
-        ])
-        amp_list = paddle.fluid.contrib.mixed_precision.AutoMixedPrecisionLists(
-                custom_white_list=['softmax', 'layer_norm', 'gelu'])
-        optimizer = paddle.fluid.contrib.mixed_precision.decorate(
+        ],
+        multi_precision=True)
+        custom_black_list=(['lookup_table', 'lookup_table_v2'])
+        amp_list = paddle.static.amp.AutoMixedPrecisionLists(
+            custom_white_list=['layer_norm', 'softmax', 'gelu'],
+            custom_black_list=custom_black_list)
+        optimizer = paddle.static.amp.decorate(
             optimizer,
             amp_list,
             init_loss_scaling=1.0,
-            use_dynamic_loss_scaling=True)
+            use_dynamic_loss_scaling=True,
+            use_pure_fp16=True)
+        # amp_list = paddle.fluid.contrib.mixed_precision.AutoMixedPrecisionLists(
+        #         custom_white_list=['softmax', 'layer_norm', 'gelu'])
+        # optimizer = paddle.fluid.contrib.mixed_precision.decorate(
+        #     optimizer,
+        #     amp_list,
+        #     init_loss_scaling=1.0,
+        #     use_dynamic_loss_scaling=True)
         optimizer.minimize(loss)
         dev_program = main_program.clone(for_test=True)
 
@@ -459,6 +472,8 @@ def do_train(args):
     reset_state_dict = reset_program_state_dict(args, model, state_dict,
                                                 pretrained_state_dict)
     paddle.static.set_program_state(main_program, reset_state_dict)
+
+    optimizer.amp_init(place)
 
     if args.load_dir is not None:
         print("-------------------- Loading model --------------------")
@@ -499,6 +514,9 @@ def do_train(args):
         print("-------------------- Replacement Start --------------------")
         ASPHelper.replace_dense_to_sparse_op(dev_program)
         # ASPHelper.compress_model(dev_program, place)
+
+        # for op in dev_program.global_block().ops:
+        #     print(op.type)
         print("-------------------- Replacement Done --------------------")
 
     overall_start_time = time.time()
